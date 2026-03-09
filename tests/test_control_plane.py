@@ -37,10 +37,20 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(result["user_id"], "newuser")
 
     def test_register_duplicate_user(self) -> None:
-        self.control.register("u1", "pass")
-        result = self.control.register("u1", "pass2")
+        self.control.register("u1", "pass123456")
+        result = self.control.register("u1", "pass2_other")
         self.assertFalse(result["ok"])
         self.assertEqual(result["message"], "user_already_exists")
+
+    def test_register_password_too_short(self) -> None:
+        result = self.control.register("u_short", "ab")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["message"], "password_too_short")
+
+    def test_register_empty_user_id(self) -> None:
+        result = self.control.register("", "password123")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["message"], "invalid_user_id")
 
     def test_logout(self) -> None:
         login = self.control.login("demo", "demo1234", "d1")

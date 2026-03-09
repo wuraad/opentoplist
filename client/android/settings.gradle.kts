@@ -1,5 +1,3 @@
-rootProject.name = "opentoplist-vpn"
-
 pluginManagement {
     repositories {
         google()
@@ -7,10 +5,12 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
-
-dependencyResolution {
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
     }
 }
+rootProject.name = "opentoplist-vpn"
+include(":app")

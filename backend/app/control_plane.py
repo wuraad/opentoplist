@@ -16,7 +16,11 @@ class ControlPlaneService:
     # ── auth ──────────────────────────────────────────────────
 
     def register(self, user_id: str, password: str, plan: str = "free") -> dict:
-        user = self.store.register_user(user_id, password, plan)
+        if not user_id or not user_id.strip():
+            return {"ok": False, "message": "invalid_user_id"}
+        if not password or len(password) < 6:
+            return {"ok": False, "message": "password_too_short"}
+        user = self.store.register_user(user_id.strip(), password, plan)
         if user is None:
             return {"ok": False, "message": "user_already_exists"}
         return {"ok": True, "user_id": user.user_id, "plan": user.plan}
