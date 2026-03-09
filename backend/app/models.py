@@ -88,3 +88,24 @@ class AbuseComplaint:
     egress_ip: str
     observed_at: datetime
     window_minutes: int = 15
+
+
+@dataclass(slots=True)
+class TokenRecord:
+    token: str
+    user_id: str
+    issued_at: datetime = field(default_factory=utc_now)
+    expires_at: Optional[datetime] = None
+
+
+@dataclass(slots=True)
+class RiskThresholds:
+    conn_high: int = 1200
+    conn_elevated: int = 600
+    port_high: int = 120
+    port_elevated: int = 60
+    bw_extreme: float = 450.0
+    bw_high: float = 200.0
+    score_ban: int = 80
+    score_quarantine: int = 55
+    score_throttle: int = 30
