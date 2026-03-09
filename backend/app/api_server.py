@@ -201,6 +201,7 @@ class ApiApplication:
                 return to_json({"ok": False, "message": "unauthorized"}, 401)
             user_id = self.store.validate_token(token)
             data = self.control.logout(token)
+            self._cache.invalidate_token(token)
             if user_id:
                 self.audit.log("user_logout", user_id=user_id)
             return to_json(data)
