@@ -55,6 +55,33 @@ class WSGIClient:
         status_code = int(status_holder[0].split(" ")[0])
         return status_code, json.loads(body_bytes)
 
+    def request_raw(
+        self, method: str, path: str, headers: Optional[dict] = None,
+    ) -> tuple[int, str]:
+        environ = {
+            "REQUEST_METHOD": method,
+            "PATH_INFO": path,
+            "QUERY_STRING": "",
+            "CONTENT_TYPE": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+            "SERVER_NAME": "localhost",
+            "SERVER_PORT": "8080",
+        }
+        if "?" in path:
+            environ["PATH_INFO"], environ["QUERY_STRING"] = path.split("?", 1)
+        hdrs = headers or {}
+        if self.token and "HTTP_AUTHORIZATION" not in hdrs:
+            hdrs["HTTP_AUTHORIZATION"] = f"Bearer {self.token}"
+        environ.update(hdrs)
+        status_holder: list[str] = []
+        def start_response(status: str, response_headers: list) -> None:
+            status_holder.append(status)
+        result = self.app(environ, start_response)
+        body_bytes = b"".join(result)
+        status_code = int(status_holder[0].split(" ")[0])
+        return status_code, body_bytes.decode("utf-8")
+
     def get(self, path: str, **kw) -> tuple[int, dict]:
         return self.request("GET", path, **kw)
 
@@ -312,11 +339,13 @@ class E2EComplaintTraceTests(unittest.TestCase):
             {"node_id": "sg-1", "egress_ip": "203.0.113.50"},
         )
         self.client.token = None
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
         code, data = self.client.post(
             "/v1/complaints/trace",
             {
                 "egress_ip": "203.0.113.50",
-                "observed_at": "2026-03-09T12:30:00+00:00",
+                "observed_at": now,
                 "window_minutes": 60,
             },
         )
@@ -346,11 +375,13 @@ class E2EComplaintTraceTests(unittest.TestCase):
         )
         self.client.token = None
 
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
         code, data = self.client.post(
             "/v1/complaints/trace",
             {
                 "egress_ip": "198.51.100.1",
-                "observed_at": "2026-03-09T12:30:00+00:00",
+                "observed_at": now,
                 "window_minutes": 60,
                 "auto_action": "ban",
             },
@@ -406,6 +437,161 @@ class E2EFullFlowTests(unittest.TestCase):
             },
         )
         self.assertEqual(risk["risk"]["action"], "allow")
+
+
+class E2EAuditTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = ApiApplication()
+        self.client = WSGIClient(self.app)
+        self.admin_headers = {"HTTP_X_ADMIN_KEY": "admin-secret-key"}
+
+    def test_audit_log_records_login(self) -> None:
+        self.client.post(
+            "/v1/auth/token",
+            {"user_id": "demo", "password": "demo1234", "device_id": "d1"},
+        )
+        code, data = self.client.get("/v1/admin/audit", headers=self.admin_headers)
+        self.assertEqual(code, 200)
+        actions = [l["action"] for l in data["logs"]]
+        self.assertIn("user_login", actions)
+
+    def test_audit_filter_by_action(self) -> None:
+        self.client.post(
+            "/v1/auth/token",
+            {"user_id": "demo", "password": "demo1234", "device_id": "d1"},
+        )
+        code, data = self.client.get(
+            "/v1/admin/audit?action=user_login", headers=self.admin_headers
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(all(l["action"] == "user_login" for l in data["logs"]))
+
+    def test_audit_requires_admin(self) -> None:
+        code, _ = self.client.get("/v1/admin/audit")
+        self.assertEqual(code, 403)
+
+
+class E2EPolicyVersionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = ApiApplication()
+        self.client = WSGIClient(self.app)
+        self.admin_headers = {"HTTP_X_ADMIN_KEY": "admin-secret-key"}
+
+    def test_policy_versioning(self) -> None:
+        code, data = self.client.post(
+            "/v1/admin/users/demo/policy",
+            {"max_bandwidth": 100},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(data["version"], 1)
+
+        code, data = self.client.post(
+            "/v1/admin/users/demo/policy",
+            {"max_bandwidth": 200},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(data["version"], 2)
+
+        code, data = self.client.get(
+            "/v1/admin/users/demo/policy/versions",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(len(data["versions"]), 2)
+        self.assertEqual(data["versions"][0]["version"], 2)
+
+
+class E2EMetricsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = WSGIClient(ApiApplication())
+
+    def test_metrics_endpoint(self) -> None:
+        self.client.post(
+            "/v1/auth/token",
+            {"user_id": "demo", "password": "demo1234", "device_id": "d1"},
+        )
+        code, data = self.client.request_raw("GET", "/metrics")
+        self.assertEqual(code, 200)
+        self.assertIn("http_requests_total", data)
+
+
+class E2EAlertTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = ApiApplication()
+        self.client = WSGIClient(self.app)
+        self.admin_headers = {"HTTP_X_ADMIN_KEY": "admin-secret-key"}
+
+    def test_alert_on_risk_ban(self) -> None:
+        self.client.post(
+            "/v1/risk/evaluate",
+            {
+                "user_id": "demo", "session_id": "s1",
+                "connection_count": 2000, "unique_dst_ports": 240,
+                "burst_bandwidth_mbps": 600,
+            },
+        )
+        code, data = self.client.get("/v1/admin/alerts", headers=self.admin_headers)
+        self.assertEqual(code, 200)
+        self.assertGreater(len(data["alerts"]), 0)
+
+    def test_evaluate_node_alerts(self) -> None:
+        code, data = self.client.post(
+            "/v1/admin/alerts/evaluate-nodes", headers=self.admin_headers
+        )
+        self.assertEqual(code, 200)
+        self.assertIn("evaluated", data)
+
+
+class E2EComplaintParseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = WSGIClient(ApiApplication())
+
+    def test_parse_complaint_text(self) -> None:
+        code, data = self.client.post(
+            "/v1/complaints/parse",
+            {
+                "text": "Abuse from IP 203.0.113.42 observed at 2026-03-09T10:00:00+00:00",
+                "source_email": "abuse@example.com",
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(data["egress_ip"], "203.0.113.42")
+
+    def test_parse_no_ip(self) -> None:
+        code, data = self.client.post(
+            "/v1/complaints/parse", {"text": "No IP here"}
+        )
+        self.assertEqual(code, 400)
+
+
+class E2ECORSTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from backend.app.api_server import create_app
+        self.app = create_app()
+
+    def test_options_preflight(self) -> None:
+        environ = {
+            "REQUEST_METHOD": "OPTIONS",
+            "PATH_INFO": "/v1/auth/token",
+            "QUERY_STRING": "",
+            "CONTENT_TYPE": "",
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": BytesIO(b""),
+            "SERVER_NAME": "localhost",
+            "SERVER_PORT": "8080",
+        }
+        status_holder: list[str] = []
+        headers_holder: list[list] = []
+
+        def start_response(status, headers):
+            status_holder.append(status)
+            headers_holder.append(headers)
+
+        self.app(environ, start_response)
+        self.assertIn("204", status_holder[0])
+        header_names = [h[0] for h in headers_holder[0]]
+        self.assertIn("Access-Control-Allow-Origin", header_names)
 
 
 if __name__ == "__main__":

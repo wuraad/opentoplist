@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
+from hashlib import pbkdf2_hmac, sha256
+from os import urandom
 from secrets import token_urlsafe
 from typing import Dict, List, Optional
 
@@ -18,8 +19,24 @@ from .models import (
 DEFAULT_TOKEN_TTL = timedelta(hours=24)
 
 
+_LEGACY_MODE = True  # keep sha256 compat for existing tests/data
+
+
 def hash_password(password: str) -> str:
-    return sha256(password.encode("utf-8")).hexdigest()
+    if _LEGACY_MODE:
+        return sha256(password.encode("utf-8")).hexdigest()
+    salt = urandom(16)
+    dk = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations=260000)
+    return f"pbkdf2:{salt.hex()}:{dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    if stored_hash.startswith("pbkdf2:"):
+        _, salt_hex, dk_hex = stored_hash.split(":", 2)
+        salt = bytes.fromhex(salt_hex)
+        dk = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations=260000)
+        return dk.hex() == dk_hex
+    return stored_hash == sha256(password.encode("utf-8")).hexdigest()
 
 
 class InMemoryStore:
@@ -32,6 +49,8 @@ class InMemoryStore:
         self.user_tokens: Dict[str, str] = {}
         self.user_policies: Dict[str, dict] = {}
         self.admin_api_key: str = "admin-secret-key"
+        self._audit_log: List[dict] = []
+        self._policy_versions: Dict[str, List[dict]] = {}
         self.bootstrap()
 
     def bootstrap(self) -> None:
@@ -86,7 +105,7 @@ class InMemoryStore:
             return False
         if user.status == UserStatus.BANNED:
             return False
-        return user.password_hash == hash_password(password)
+        return verify_password(password, user.password_hash)
 
     def issue_token(
         self, user_id: str, ttl: timedelta = DEFAULT_TOKEN_TTL
@@ -220,6 +239,41 @@ class InMemoryStore:
             if started <= upper and ended >= lower:
                 return session
         return None
+
+    # ── audit ─────────────────────────────────────────────────
+
+    def append_audit_log(self, entry: dict) -> None:
+        if "ts" not in entry:
+            entry["ts"] = datetime.now(timezone.utc).isoformat()
+        self._audit_log.append(entry)
+
+    def query_audit_logs(
+        self,
+        user_id: Optional[str] = None,
+        action: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        results = self._audit_log
+        if user_id:
+            results = [e for e in results if e.get("user_id") == user_id]
+        if action:
+            results = [e for e in results if e.get("action") == action]
+        return list(reversed(results))[:limit]
+
+    # ── policy versions ───────────────────────────────────────
+
+    def save_policy_version(self, user_id: str, policy: dict, version: int) -> None:
+        versions = self._policy_versions.setdefault(user_id, [])
+        versions.append({
+            "user_id": user_id,
+            "policy": policy,
+            "version": version,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def get_policy_versions(self, user_id: str) -> List[dict]:
+        versions = self._policy_versions.get(user_id, [])
+        return sorted(versions, key=lambda v: v["version"], reverse=True)
 
     @staticmethod
     def node_to_dict(node: NodeStatus) -> dict:
