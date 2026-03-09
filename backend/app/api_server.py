@@ -11,8 +11,11 @@ from wsgiref.simple_server import make_server
 
 from .alert import AlertManager
 from .audit import AuditLogger
+from .cache import MemoryCache, TokenCache
 from .complaint_parser import parse_complaint_text
 from .control_plane import ControlPlaneService
+from .gateway_agent import GatewayAgent, WgNodeConfig
+from .jwt_auth import create_jwt, verify_jwt
 from .logging_config import setup_logging
 from .metrics import MetricsRegistry
 from .middleware import CORSMiddleware, RateLimitMiddleware, RequestLogMiddleware
@@ -62,6 +65,10 @@ class ApiApplication:
         self.alerts = AlertManager(webhook_url=os.environ.get("ALERT_WEBHOOK_URL"))
         self.metrics = MetricsRegistry()
         self._node_auth_key = os.environ.get("NODE_AUTH_KEY", "")
+        self._jwt_secret = os.environ.get("JWT_SECRET", "change-me-in-production-use-a-64-char-random-string")
+        self._use_jwt = os.environ.get("USE_JWT", "0") == "1"
+        self._cache = TokenCache(MemoryCache())
+        self.gateway = GatewayAgent()
 
     def __call__(
         self,
@@ -106,7 +113,18 @@ class ApiApplication:
         token = self._bearer_token(environ)
         if token is None:
             return None
-        return self.store.validate_token(token)
+        if self._use_jwt:
+            payload = verify_jwt(token, self._jwt_secret)
+            if payload:
+                return payload.get("sub")
+            return None
+        cached = self._cache.get_user_for_token(token)
+        if cached:
+            return cached
+        user_id = self.store.validate_token(token)
+        if user_id:
+            self._cache.cache_token(token, user_id, ttl=300)
+        return user_id
 
     def _require_auth(self, environ: dict) -> tuple[Optional[str], Optional[JSON]]:
         user_id = self._resolve_user(environ)
@@ -169,6 +187,10 @@ class ApiApplication:
             ok = data.get("ok")
             self.metrics.auth_attempts.inc({"result": "login_ok" if ok else "login_fail"})
             if ok:
+                if self._use_jwt:
+                    user = self.store.users.get(body["user_id"])
+                    plan = user.plan if user else "free"
+                    data["jwt"] = create_jwt(body["user_id"], plan=plan, secret=self._jwt_secret)
                 self.audit.log("user_login", user_id=body["user_id"],
                                detail={"device_id": body["device_id"]})
             return to_json(data, status_code=200 if ok else 401)
@@ -433,10 +455,108 @@ class ApiApplication:
                 "alerts": [{"rule": e.rule_name, "severity": e.severity, "message": e.message} for e in events],
             })
 
+        # ── gateway management ────────────────────────────────
+        if method == "POST" and path == "/v1/gateway/nodes/register":
+            err = self._require_admin(environ)
+            if err:
+                return err
+            body = parse_json_body(environ)
+            err = require_fields(body, "node_id", "region", "endpoint", "public_key")
+            if err:
+                return err
+            config = WgNodeConfig(
+                node_id=body["node_id"], region=body["region"],
+                endpoint=body["endpoint"], public_key=body["public_key"],
+                subnet=body.get("subnet", "10.66.0.0/24"),
+                listen_port=int(body.get("listen_port", 51820)),
+            )
+            data = self.gateway.register_node(config)
+            self.audit.log("gateway_node_register", detail={"node_id": body["node_id"]})
+            return to_json(data)
+
+        if method == "POST" and path == "/v1/gateway/peers/allocate":
+            user_id, err = self._require_auth(environ)
+            if err:
+                return err
+            body = parse_json_body(environ)
+            err = require_fields(body, "node_id", "client_public_key")
+            if err:
+                return err
+            device_id = body.get("device_id", "default")
+            result = self.gateway.allocate_peer(
+                user_id=user_id, device_id=device_id,
+                node_id=body["node_id"], client_public_key=body["client_public_key"],
+            )
+            if not result:
+                return to_json({"ok": False, "message": "allocation_failed"}, 400)
+            self.audit.log("peer_allocate", user_id=user_id,
+                           detail={"node_id": body["node_id"]})
+            return to_json(result)
+
+        if method == "GET" and path == "/v1/gateway/peers":
+            user_id, err = self._require_auth(environ)
+            if err:
+                return err
+            peers = self.gateway.list_user_peers(user_id)
+            return to_json({"ok": True, "peers": peers})
+
+        if method == "POST" and path == "/v1/gateway/peers/revoke":
+            user_id, err = self._require_auth(environ)
+            if err:
+                return err
+            body = parse_json_body(environ)
+            err = require_fields(body, "node_id")
+            if err:
+                return err
+            device_id = body.get("device_id", "default")
+            ok = self.gateway.revoke_peer(user_id, device_id, body["node_id"])
+            return to_json({"ok": ok})
+
+        # ── session end ──────────────────────────────────────
+        if method == "POST" and path == "/v1/sessions/end":
+            user_id, err = self._require_auth(environ)
+            if err:
+                return err
+            body = parse_json_body(environ)
+            err = require_fields(body, "session_id")
+            if err:
+                return err
+            session = self.store.sessions.get(body["session_id"]) if hasattr(self.store, 'sessions') else None
+            if session and session.user_id == user_id:
+                session.ended_at = datetime.now(timezone.utc)
+                self.metrics.active_sessions.inc(value=-1)
+                self.audit.log("session_end", user_id=user_id,
+                               detail={"session_id": body["session_id"]})
+                return to_json({"ok": True})
+            return to_json({"ok": False, "message": "session_not_found"}, 404)
+
+        # ── password change ──────────────────────────────────
+        if method == "POST" and path == "/v1/auth/change-password":
+            user_id, err = self._require_auth(environ)
+            if err:
+                return err
+            body = parse_json_body(environ)
+            err = require_fields(body, "old_password", "new_password")
+            if err:
+                return err
+            if not self.store.authenticate(user_id, body["old_password"]):
+                return to_json({"ok": False, "message": "invalid_password"}, 401)
+            from .store import hash_password as _hp
+            user = self.store.users.get(user_id)
+            if user:
+                user.password_hash = _hp(body["new_password"])
+                if hasattr(self.store, 'users') and isinstance(self.store.users, dict):
+                    self.store.users[user_id] = user
+            self.audit.log("password_change", user_id=user_id)
+            return to_json({"ok": True})
+
         return to_json({"ok": False, "message": "not_found"}, 404)
 
 
-def create_app(store: InMemoryStore | None = None) -> Callable:
+def create_app(store=None) -> Callable:
+    if store is None:
+        from .server_config import create_store
+        store = create_store()
     app: Callable = ApiApplication(store)
     log_fn = lambda entry: logger.info(
         f"{entry['method']} {entry['path']} {entry['status']} {entry['elapsed_ms']}ms"
@@ -448,10 +568,17 @@ def create_app(store: InMemoryStore | None = None) -> Callable:
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080) -> None:
+    from .server_config import create_ssl_context
     app = create_app()
     with make_server(host, port, app) as server:
-        logger.info(f"[control-plane] serving on http://{host}:{port}")
-        print(f"[control-plane] serving on http://{host}:{port}")
+        ssl_ctx = create_ssl_context()
+        if ssl_ctx:
+            server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+            proto = "https"
+        else:
+            proto = "http"
+        logger.info(f"[control-plane] serving on {proto}://{host}:{port}")
+        print(f"[control-plane] serving on {proto}://{host}:{port}")
         server.serve_forever()
 
 

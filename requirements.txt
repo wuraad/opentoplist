@@ -1,0 +1,6 @@
+# Production dependencies (optional — backend runs on stdlib alone for dev/test)
+# Install only when using PostgreSQL or Redis backends:
+#   pip install -r requirements.txt
+
+psycopg2-binary>=2.9.9
+redis>=5.0.0
